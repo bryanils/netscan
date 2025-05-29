@@ -54,7 +54,7 @@ var commonServices = map[int]string{
 
 func main() {
 	fmt.Println("🔍 Network Discovery & Port Scanner")
-	fmt.Println("===================================")
+	fmt.Println("-===================================-")
 	
 	scanner := bufio.NewScanner(os.Stdin)
 	
