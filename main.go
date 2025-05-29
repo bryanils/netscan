@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
+	"netscan/scanner"
 	"os"
 	"sort"
 	"strconv"
@@ -93,7 +95,7 @@ func main() {
 			usrIn.Scan()
 			portRange := strings.TrimSpace(usrIn.Text())
 			ports := parsePortRange(portRange)
-			networkDiscovery(network, ports)
+			scanner.NetworkDiscovery(network, ports)
 		case "4":
 			fmt.Print("Enter hosts to monitor (comma-separated): ")
 			usrIn.Scan()
@@ -112,106 +114,201 @@ func main() {
 	}
 }
 
+// Batch processing version for very large networks
 func pingSweep(network string) {
-	fmt.Printf("\n🔍 Scanning network: %s\n", network)
+	fmt.Printf("\n🔍 Batch scanning network: %s\n", network)
 
 	ips := generateIPs(network)
-	var wg sync.WaitGroup
-	results := make(chan HostResult, len(ips))
+	const batchSize = 254 // Process one subnet at a time
+	const maxConcurrent = 500
 
-	// Limit concurrent goroutines
-	sem := make(chan struct{}, 50)
+	var allHosts []HostResult
+	var resultsMutex sync.Mutex
 
 	start := time.Now()
 
-	for _, ip := range ips {
-		wg.Add(1)
-		go func(ip string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			start := time.Now()
-			alive := pingHost(ip)
-			latency := time.Since(start)
-
-			results <- HostResult{
-				IP:      ip,
-				Alive:   alive,
-				Latency: latency,
-			}
-		}(ip)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var liveHosts []HostResult
-	for result := range results {
-		if result.Alive {
-			liveHosts = append(liveHosts, result)
+	for i := 0; i < len(ips); i += batchSize {
+		end := i + batchSize
+		if end > len(ips) {
+			end = len(ips)
 		}
+
+		batch := ips[i:end]
+		batchStart := time.Now()
+
+		var wg sync.WaitGroup
+		results := make(chan HostResult, len(batch))
+		sem := make(chan struct{}, maxConcurrent)
+
+		for _, ip := range batch {
+			wg.Add(1)
+			go func(ip string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				pingStart := time.Now()
+				alive := pingHostFast(ip)
+				latency := time.Since(pingStart)
+
+				if alive {
+					results <- HostResult{
+						IP:      ip,
+						Alive:   alive,
+						Latency: latency,
+					}
+				}
+			}(ip)
+		}
+
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+
+		var batchHosts []HostResult
+		for result := range results {
+			batchHosts = append(batchHosts, result)
+		}
+
+		resultsMutex.Lock()
+		allHosts = append(allHosts, batchHosts...)
+		resultsMutex.Unlock()
+
+		batchElapsed := time.Since(batchStart)
+		fmt.Printf("📈 Batch %d/%d: %d hosts found in %v\n",
+			(i/batchSize)+1, (len(ips)+batchSize-1)/batchSize,
+			len(batchHosts), batchElapsed)
 	}
 
 	elapsed := time.Since(start)
 
-	fmt.Printf("\n✅ Scan completed in %v\n", elapsed)
-	fmt.Printf("📊 Found %d live hosts out of %d scanned:\n\n", len(liveHosts), len(ips))
-
-	sort.Slice(liveHosts, func(i, j int) bool {
-		return liveHosts[i].IP < liveHosts[j].IP
+	sort.Slice(allHosts, func(i, j int) bool {
+		return compareIPs(allHosts[i].IP, allHosts[j].IP)
 	})
 
-	for _, host := range liveHosts {
+	fmt.Printf("\n✅ Batch scan completed in %v\n", elapsed)
+	fmt.Printf("📊 Found %d live hosts out of %d scanned:\n\n", len(allHosts), len(ips))
+
+	for _, host := range allHosts {
 		fmt.Printf("🟢 %-15s (%.2fms)\n", host.IP, float64(host.Latency.Nanoseconds())/1000000)
 	}
+}
+
+// another helper
+// Fast ping using TCP connect instead of ICMP
+func pingHostFast(ip string) bool {
+	// Try multiple common ports quickly
+	ports := []int{80, 443, 22, 21, 23, 25, 53, 135, 139, 445}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Use a channel to return as soon as any port responds
+	success := make(chan bool, len(ports))
+
+	for _, port := range ports {
+		go func(p int) {
+			address := fmt.Sprintf("%s:%d", ip, p)
+			conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				select {
+				case success <- true:
+				default:
+				}
+			}
+		}(port)
+	}
+
+	select {
+	case <-success:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Helper function to properly sort IPs numerically
+func compareIPs(ip1, ip2 string) bool {
+	// Convert IPs to comparable format
+	parts1 := strings.Split(ip1, ".")
+	parts2 := strings.Split(ip2, ".")
+
+	for i := 0; i < 4; i++ {
+		var n1, n2 int
+		fmt.Sscanf(parts1[i], "%d", &n1)
+		fmt.Sscanf(parts2[i], "%d", &n2)
+		if n1 != n2 {
+			return n1 < n2
+		}
+	}
+	return false
 }
 
 func scanPorts(target string, ports []int) {
 	fmt.Printf("\n🔍 Scanning %s for %d ports...\n", target, len(ports))
 
-	var wg sync.WaitGroup
-	results := make(chan PortResult, len(ports))
-	sem := make(chan struct{}, 1000) // Limit concurrent connections
+	const batchSize = 1000
+	const maxConcurrent = 5000
+
+	var allResults []PortResult
+	var resultsMutex sync.Mutex
 
 	start := time.Now()
 
-	for _, port := range ports {
-		wg.Add(1)
-		go func(port int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			result := scanPort(target, port)
-			results <- result
-		}(port)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var openPorts []PortResult
-	for result := range results {
-		if result.Open {
-			openPorts = append(openPorts, result)
+	// Process ports in batches
+	for i := 0; i < len(ports); i += batchSize {
+		end := i + batchSize
+		if end > len(ports) {
+			end = len(ports)
 		}
+
+		batch := ports[i:end]
+
+		var wg sync.WaitGroup
+		results := make(chan PortResult, len(batch))
+		sem := make(chan struct{}, maxConcurrent)
+
+		for _, port := range batch {
+			wg.Add(1)
+			go func(port int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				result := scanPort(target, port)
+				if result.Open {
+					results <- result
+				}
+			}(port)
+		}
+
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+
+		// Collect batch results
+		for result := range results {
+			resultsMutex.Lock()
+			allResults = append(allResults, result)
+			resultsMutex.Unlock()
+		}
+
+		fmt.Printf("📈 Processed batch %d/%d\n", (i/batchSize)+1, (len(ports)+batchSize-1)/batchSize)
 	}
 
 	elapsed := time.Since(start)
 
-	sort.Slice(openPorts, func(i, j int) bool {
-		return openPorts[i].Port < openPorts[j].Port
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].Port < allResults[j].Port
 	})
 
 	fmt.Printf("\n✅ Scan completed in %v\n", elapsed)
-	fmt.Printf("📊 Found %d open ports:\n\n", len(openPorts))
+	fmt.Printf("📊 Found %d open ports:\n\n", len(allResults))
 
-	for _, port := range openPorts {
+	for _, port := range allResults {
 		service := port.Service
 		if service == "" {
 			service = "Unknown"
@@ -224,76 +321,76 @@ func scanPorts(target string, ports []int) {
 	}
 }
 
-func networkDiscovery(network string, ports []int) {
-	fmt.Printf("\n🔍 Network discovery on %s\n", network)
+// func networkDiscovery(network string, ports []int) {
+// 	fmt.Printf("\n🔍 Network discovery on %s\n", network)
 
-	ips := generateIPs(network)
-	var wg sync.WaitGroup
-	results := make(chan HostResult, len(ips))
-	sem := make(chan struct{}, 20)
+// 	ips := generateIPs(network)
+// 	var wg sync.WaitGroup
+// 	results := make(chan HostResult, len(ips))
+// 	sem := make(chan struct{}, 20)
 
-	start := time.Now()
+// 	start := time.Now()
 
-	for _, ip := range ips {
-		wg.Add(1)
-		go func(ip string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+// 	for _, ip := range ips {
+// 		wg.Add(1)
+// 		go func(ip string) {
+// 			defer wg.Done()
+// 			sem <- struct{}{}
+// 			defer func() { <-sem }()
 
-			if pingHost(ip) {
-				var portResults []PortResult
-				for _, port := range ports {
-					result := scanPort(ip, port)
-					if result.Open {
-						portResults = append(portResults, result)
-					}
-				}
+// 			if pingHost(ip) {
+// 				var portResults []PortResult
+// 				for _, port := range ports {
+// 					result := scanPort(ip, port)
+// 					if result.Open {
+// 						portResults = append(portResults, result)
+// 					}
+// 				}
 
-				results <- HostResult{
-					IP:    ip,
-					Alive: true,
-					Ports: portResults,
-				}
-			}
-		}(ip)
-	}
+// 				results <- HostResult{
+// 					IP:    ip,
+// 					Alive: true,
+// 					Ports: portResults,
+// 				}
+// 			}
+// 		}(ip)
+// 	}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+// 	go func() {
+// 		wg.Wait()
+// 		close(results)
+// 	}()
 
-	var hosts []HostResult
-	for result := range results {
-		hosts = append(hosts, result)
-	}
+// 	var hosts []HostResult
+// 	for result := range results {
+// 		hosts = append(hosts, result)
+// 	}
 
-	elapsed := time.Since(start)
+// 	elapsed := time.Since(start)
 
-	sort.Slice(hosts, func(i, j int) bool {
-		return hosts[i].IP < hosts[j].IP
-	})
+// 	sort.Slice(hosts, func(i, j int) bool {
+// 		return hosts[i].IP < hosts[j].IP
+// 	})
 
-	fmt.Printf("\n✅ Discovery completed in %v\n", elapsed)
-	fmt.Printf("📊 Found %d live hosts:\n\n", len(hosts))
+// 	fmt.Printf("\n✅ Discovery completed in %v\n", elapsed)
+// 	fmt.Printf("📊 Found %d live hosts:\n\n", len(hosts))
 
-	for _, host := range hosts {
-		fmt.Printf("🖥️  %s\n", host.IP)
-		if len(host.Ports) > 0 {
-			for _, port := range host.Ports {
-				service := port.Service
-				if service == "" {
-					service = "Unknown"
-				}
-				fmt.Printf("   🟢 %-5d %s\n", port.Port, service)
-			}
-		} else {
-			fmt.Printf("   📝 No open ports found in scanned range\n")
-		}
-		fmt.Println()
-	}
-}
+// 	for _, host := range hosts {
+// 		fmt.Printf("🖥️  %s\n", host.IP)
+// 		if len(host.Ports) > 0 {
+// 			for _, port := range host.Ports {
+// 				service := port.Service
+// 				if service == "" {
+// 					service = "Unknown"
+// 				}
+// 				fmt.Printf("   🟢 %-5d %s\n", port.Port, service)
+// 			}
+// 		} else {
+// 			fmt.Printf("   📝 No open ports found in scanned range\n")
+// 		}
+// 		fmt.Println()
+// 	}
+// }
 
 func monitorPorts(hosts []string, ports []int) {
 	fmt.Printf("\n👀 Monitoring %d hosts on %d ports (Ctrl+C to stop)\n", len(hosts), len(ports))
